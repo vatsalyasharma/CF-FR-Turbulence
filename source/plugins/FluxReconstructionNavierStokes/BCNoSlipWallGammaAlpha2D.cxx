@@ -1,0 +1,631 @@
+#include <limits>
+
+#include "Framework/MethodStrategyProvider.hh"
+
+#include "NavierStokes/Euler2DVarSet.hh"
+#include "NavierStokes/EulerTerm.hh"
+
+#include "FluxReconstructionNavierStokes/FluxReconstructionNavierStokes.hh"
+#include "FluxReconstructionNavierStokes/BCNoSlipWallGammaAlpha2D.hh"
+#include "FluxReconstructionTurb/GammaAlphaOnsetTable.hh"
+#include "FluxReconstructionNavierStokes/NSBoundaryState.hh"
+
+#include "Common/NotImplementedException.hh"
+
+//////////////////////////////////////////////////////////////////////////////
+
+using namespace std;
+using namespace COOLFluiD::Framework;
+using namespace COOLFluiD::Physics::NavierStokes;
+using namespace COOLFluiD::Common;
+
+//////////////////////////////////////////////////////////////////////////////
+
+namespace COOLFluiD {
+
+  namespace FluxReconstructionMethod {
+
+//////////////////////////////////////////////////////////////////////////////
+
+Framework::MethodStrategyProvider<
+    BCNoSlipWallGammaAlpha2D,FluxReconstructionSolverData,BCStateComputer,FluxReconstructionNavierStokesModule >
+  BCNoSlipWallGammaAlpha2DProvider("BCNoSlipWallGammaAlpha2D");
+
+//////////////////////////////////////////////////////////////////////////////
+
+void BCNoSlipWallGammaAlpha2D::defineConfigOptions(Config::OptionList& options)
+{
+  options.addConfigOption< CFreal >("yWallVelocity","Y-component of a velocity vector of the wall.");
+  options.addConfigOption< CFreal >("xWallVelocity","X-component of a velocity vector of the wall.");
+  options.addConfigOption< CFreal >("KWall","Wall value for turbulent intensity");
+  options.addConfigOption< CFreal,Config::DynamicOption<> >("T","wall static temperature");
+  options.addConfigOption< CFreal >("q","wall heat flux");
+  options.addConfigOption< bool >("HeatFlux","bool to tell if the wall has constant heat flux (possibly zero), default true.");
+  options.addConfigOption< CFuint,Config::DynamicOption<> >("ChangeToIsoT","Iteration after which to switch to an isothermal BC.");
+  options.addConfigOption< bool >("LegacyGhost","Use the previous ghost state (the wall state) "
+    "instead of the reflected one (interior density, reflected velocity and temperature), default false.");
+  options.addConfigOption< CFreal >("WallDist","Characteristic distance of first sol pnt from the wall.");
+  options.addConfigOption< CFreal >("OmegaWallFactor","Factor by which to multiply omegaWall each iteration until it is the theoretical value (Default 1.01).");
+  options.addConfigOption< CFuint >("ImposeOmegaWallIter","Iteration at which to impose theoretical omegaWall value.");
+  options.addConfigOption< CFreal,Config::DynamicOption<>  >("GammaThreshold","Threshold beyond which gamma is considered to be transitioning if transition already occurred (Default 0.02).");
+  options.addConfigOption< bool,Config::DynamicOption<>  >("EnforceLaminar","Flag to enforce laminar flow at all times (Default false).");
+  options.addConfigOption< bool >("SmoothOnset","Wall gamma ghost (1-F) 0.01 + F gamma_interior with the smooth onset function F of the gamma-alpha source (OnsetFunction), instead of the 0.01/interior switch (default false).");
+  options.addConfigOption< bool >("WallLaw","Wall value of gamma from the wall law of the gamma-alpha source (its option WallLaw), as a Dirichlet value (ghost and BR2 normal gradient kept); default false.");
+  options.addConfigOption< bool >("DirichletPreOnset","With SmoothOnset: keep the BR2 normal gamma gradient in the wall diffusive flux with weight 1-F (consistent gamma = 0.01 wall before onset, zero flux after); default false = normal gamma gradient always removed.");
+  options.addConfigOption< CFreal >("OnsetWidth","Relative width of F = (1 + tanh(((alpha - tau_w*)/alpha)/w))/2 for SmoothOnset (default 0.05).");
+  options.addConfigOption< CFreal,Config::DynamicOption<>  >("LeadingEdgeLaminarEnforce","Streamwise x cutoff: enforce laminarity at or below this coordinate; default -infinity disables the coordinate restriction.");
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+BCNoSlipWallGammaAlpha2D::BCNoSlipWallGammaAlpha2D(const std::string& name) :
+  BCStateComputer(name),
+  m_varSetTurb(CFNULL),
+  m_diffVarTurb(CFNULL),
+  m_ghostSolPhysData(),
+  m_intSolPhysData(),
+  m_prevIter(0),
+  m_transitionOccurred(false)
+{
+  CFAUTOTRACE;
+
+  addConfigOptionsTo(this);
+   
+  m_wallT = 0.0;
+   setParameter("T",&m_wallT);
+
+  m_wallQ = 0.0;
+   setParameter("q",&m_wallQ);
+
+  m_heatFlux= true;
+   setParameter("HeatFlux",&m_heatFlux);
+   
+  m_changeToIsoT = MathTools::MathConsts::CFuintMax();
+   setParameter("ChangeToIsoT",&m_changeToIsoT);
+
+  m_legacyGhost = false;
+   setParameter("LegacyGhost",&m_legacyGhost);
+   
+  m_xWallVelocity = 0.0;
+   setParameter("xWallVelocity",&m_xWallVelocity);
+  
+  m_yWallVelocity = 0.0;
+   setParameter("yWallVelocity",&m_yWallVelocity);
+  
+  m_wallK = 0.0;
+   setParameter("KWall",&m_wallK);
+   
+   m_wallDist = 1.0e-5;
+   setParameter("WallDist",&m_wallDist);
+   
+   m_imposeOmegaWallIter = 0;
+   setParameter("ImposeOmegaWallIter",&m_imposeOmegaWallIter);
+   
+   m_omegaWallFactor = 1.01;
+   setParameter("OmegaWallFactor",&m_omegaWallFactor);
+   
+   m_gammaThreshold = 0.02;
+   setParameter("GammaThreshold",&m_gammaThreshold);
+   
+   m_enforceLaminar = false;
+   setParameter("EnforceLaminar",&m_enforceLaminar);
+   
+   // Disable the coordinate restriction by default. Negating an unsigned maximum
+   // wraps to +1 before conversion to CFreal and unintentionally delays release.
+   m_leadingEdgeLaminarEnforce = -std::numeric_limits<CFreal>::infinity();
+   setParameter("LeadingEdgeLaminarEnforce",&m_leadingEdgeLaminarEnforce);
+
+  m_smoothOnset = false;
+  setParameter("SmoothOnset",&m_smoothOnset);
+
+  m_onsetWidth = 0.05;
+  setParameter("OnsetWidth",&m_onsetWidth);
+
+  m_dirichletPreOnset = false;
+  setParameter("DirichletPreOnset",&m_dirichletPreOnset);
+
+  m_wallLaw = false;
+  setParameter("WallLaw",&m_wallLaw);
+  m_wallLawMisses = 0;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+BCNoSlipWallGammaAlpha2D::~BCNoSlipWallGammaAlpha2D()
+{
+  CFAUTOTRACE;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+CFreal BCNoSlipWallGammaAlpha2D::smoothOnsetFraction(const RealVector& coord) const
+{
+  // margin of this flux point, recorded by the criterion pass of this residual evaluation; laminar until known
+  const std::map< std::pair<CFreal,CFreal>, CFreal >& table = gammaAlphaOnsetTable();
+  const std::map< std::pair<CFreal,CFreal>, CFreal >::const_iterator it = findWallPoint(table, coord[XX], coord[YY]);
+  return (it == table.end() || m_enforceLaminar) ? 0.0 : 0.5*(1.0 + std::tanh(it->second/m_onsetWidth));
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+bool BCNoSlipWallGammaAlpha2D::releaseGammaAtWall(CFreal intermittency, bool criterion, CFreal x) const
+{
+  return (criterion || intermittency > m_gammaThreshold) &&
+         !m_enforceLaminar && x > m_leadingEdgeLaminarEnforce;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+void BCNoSlipWallGammaAlpha2D::computeGhostStates(const vector< State* >& intStates,
+                                                    vector< State* >& ghostStates,
+                                                    const std::vector< RealVector >& normals,
+                                                    const std::vector< RealVector >& coords)
+{
+  // number of states
+  const CFuint nbrStates = ghostStates.size();
+  cf_assert(nbrStates == intStates.size());
+  cf_assert(nbrStates == normals.size());
+  
+  const CFuint iK = m_varSetTurb->getModel()->getFirstScalarVar(0);
+  const CFuint nbTurbVars = m_varSetTurb->getModel()->getNbScalarVars(0);
+  
+  const CFuint iter = SubSystemStatusStack::getActive()->getNbIter();
+  
+  if (iter >= m_changeToIsoT && m_heatFlux)
+  {
+    m_heatFlux = false;
+  }
+
+  // get some data from the physical model
+  const CFreal gamma = m_varSetTurb->getModel()->getGamma();
+  const CFreal gammaDivGammaMinus1 = gamma/(gamma -1.0);
+  const CFreal R = m_varSetTurb->getModel()->getR();
+
+  // loop over the states
+  for (CFuint iState = 0; iState < nbrStates; ++iState)
+  {
+    // dereference states
+    State& intState   = (*intStates[iState]);
+    State& ghostState = (*ghostStates[iState]);
+
+    // set the physical data starting from the inner state
+    m_varSetTurb->computePhysicalData(intState,m_intSolPhysData);
+    
+    if (!m_legacyGhost)
+    {
+      // interior density, velocity reflected about the wall velocity, temperature reflected about the
+      // wall temperature (isothermal wall) or copied (heat-flux wall), pressure from density and temperature
+      const CFreal innerT = m_intSolPhysData[EulerTerm::P]/(R*m_intSolPhysData[EulerTerm::RHO]);
+      const CFreal ghostT = m_heatFlux ? innerT : max(2.0*m_wallT - innerT,0.01*m_wallT);
+      const CFreal ghostRho = m_intSolPhysData[EulerTerm::RHO];
+      const CFreal ghostP   = ghostRho*R*ghostT;
+
+      m_ghostSolPhysData[EulerTerm::RHO] = ghostRho;
+      m_ghostSolPhysData[EulerTerm::VX]  = 2.0*m_xWallVelocity - m_intSolPhysData[EulerTerm::VX];
+      m_ghostSolPhysData[EulerTerm::VY]  = 2.0*m_yWallVelocity - m_intSolPhysData[EulerTerm::VY];
+      m_ghostSolPhysData[EulerTerm::V]   = sqrt(m_ghostSolPhysData[EulerTerm::VX]*m_ghostSolPhysData[EulerTerm::VX] +
+                                              m_ghostSolPhysData[EulerTerm::VY]*m_ghostSolPhysData[EulerTerm::VY]);
+      m_ghostSolPhysData[EulerTerm::P]   = ghostP;
+      m_ghostSolPhysData[EulerTerm::H]   = (gammaDivGammaMinus1*ghostP + 0.5*ghostRho*
+                                            m_ghostSolPhysData[EulerTerm::V]*m_ghostSolPhysData[EulerTerm::V])/ghostRho;
+      m_ghostSolPhysData[EulerTerm::A]   = sqrt(gamma*ghostP/ghostRho);
+      m_ghostSolPhysData[EulerTerm::T]   = ghostT;
+      m_ghostSolPhysData[EulerTerm::E]   = m_ghostSolPhysData[EulerTerm::H] - ghostP/ghostRho;
+    }
+    else if (m_heatFlux)
+    {
+      // set the physical data for the ghost state
+      m_ghostSolPhysData[EulerTerm::RHO] = m_intSolPhysData[EulerTerm::RHO];
+      m_ghostSolPhysData[EulerTerm::VX]  = m_xWallVelocity;//2.0*m_xWallVelocity-m_intSolPhysData[EulerTerm::VX];// negate velocity )-- average = 0
+      m_ghostSolPhysData[EulerTerm::VY]  = m_yWallVelocity;//2.0*m_yWallVelocity-m_intSolPhysData[EulerTerm::VY];// negate velocity )-- average = 0
+      m_ghostSolPhysData[EulerTerm::V] = sqrt(m_ghostSolPhysData[EulerTerm::VX]*m_ghostSolPhysData[EulerTerm::VX]+m_ghostSolPhysData[EulerTerm::VY]*m_ghostSolPhysData[EulerTerm::VY]);
+      m_ghostSolPhysData[EulerTerm::P]   = m_intSolPhysData[EulerTerm::P];
+      m_ghostSolPhysData[EulerTerm::H]   = (gammaDivGammaMinus1*m_ghostSolPhysData[EulerTerm::P]
+                                            + 0.5*m_ghostSolPhysData[EulerTerm::RHO]*
+                                                  m_ghostSolPhysData[EulerTerm::V]*
+                                                  m_ghostSolPhysData[EulerTerm::V]
+                                         )/m_ghostSolPhysData[EulerTerm::RHO];
+      m_ghostSolPhysData[EulerTerm::A] = sqrt(gamma*m_ghostSolPhysData[EulerTerm::P]/m_ghostSolPhysData[EulerTerm::RHO]);
+      m_ghostSolPhysData[EulerTerm::T] = m_intSolPhysData[EulerTerm::T];
+      m_ghostSolPhysData[EulerTerm::E] = m_ghostSolPhysData[EulerTerm::H] -
+                                         (m_ghostSolPhysData[EulerTerm::P]/m_ghostSolPhysData[EulerTerm::RHO]);
+    }
+    else
+    {
+      const CFreal innerT = m_intSolPhysData[EulerTerm::P]/(R*m_intSolPhysData[EulerTerm::RHO]);
+      
+      CFreal ghostT = m_wallT;
+
+      // set the physical data for the ghost state
+      m_ghostSolPhysData[EulerTerm::RHO] = m_intSolPhysData[EulerTerm::P]/(R*ghostT); //m_intSolPhysData[EulerTerm::RHO];
+      m_ghostSolPhysData[EulerTerm::VX]  = m_xWallVelocity;//2.0*m_xWallVelocity-m_intSolPhysData[EulerTerm::VX];// negate velocity )-- average = 0
+      m_ghostSolPhysData[EulerTerm::VY]  = m_yWallVelocity;//2.0*m_yWallVelocity-m_intSolPhysData[EulerTerm::VY];// negate velocity )-- average = 0
+      m_ghostSolPhysData[EulerTerm::V] = sqrt(m_ghostSolPhysData[EulerTerm::VX]*m_ghostSolPhysData[EulerTerm::VX]+m_ghostSolPhysData[EulerTerm::VY]*m_ghostSolPhysData[EulerTerm::VY]);
+      m_ghostSolPhysData[EulerTerm::P]   = m_intSolPhysData[EulerTerm::P]; //ghostP;
+      m_ghostSolPhysData[EulerTerm::H]   = (gammaDivGammaMinus1*m_ghostSolPhysData[EulerTerm::P]
+                                            + 0.5*m_ghostSolPhysData[EulerTerm::RHO]*
+                                                  m_ghostSolPhysData[EulerTerm::V]*
+                                                  m_ghostSolPhysData[EulerTerm::V]
+                                         )/m_ghostSolPhysData[EulerTerm::RHO];
+      m_ghostSolPhysData[EulerTerm::A] = sqrt(gamma*m_ghostSolPhysData[EulerTerm::P]/m_ghostSolPhysData[EulerTerm::RHO]);
+      m_ghostSolPhysData[EulerTerm::T] = ghostT;
+      m_ghostSolPhysData[EulerTerm::E] = m_ghostSolPhysData[EulerTerm::H] -
+                                         (m_ghostSolPhysData[EulerTerm::P]/m_ghostSolPhysData[EulerTerm::RHO]);
+    }
+
+    // wall values for the wall model of the turbulence variables: the ghost itself with the legacy
+    // ghost, otherwise the interior pressure with the wall (isothermal) or interior (heat flux) temperature
+    const CFreal wallP   = m_legacyGhost ? m_ghostSolPhysData[EulerTerm::P] : m_intSolPhysData[EulerTerm::P];
+    const CFreal wallT   = m_legacyGhost ? m_ghostSolPhysData[EulerTerm::T] :
+                           (m_heatFlux ? m_intSolPhysData[EulerTerm::T] : m_wallT);
+    const CFreal wallRho = m_legacyGhost ? m_ghostSolPhysData[EulerTerm::RHO] : wallP/(R*wallT);
+
+    m_ghostSolPhysData[iK] = m_wallK;
+    
+    const CFreal pdim =  wallP * m_varSetTurb->getModel()->getPressRef();
+    const CFreal Tdim =  wallT * m_varSetTurb->getModel()->getTempRef();
+    const CFreal mu = m_diffVarTurb->getModel().getDynViscosityDim(pdim, Tdim)/(m_diffVarTurb->getModel().getReferencePhysicalData())[NSTurbTerm::MU];
+    
+    // check if it is k-omega and not SA
+    if(nbTurbVars == 2 || nbTurbVars == 4)
+    {
+      //Compute distance to innerstate
+      CFreal y0 = m_wallDist;//1.e-9;
+    
+      //avoid too small distances
+      //y0 = std::max(y0, 10.e-10);
+    
+      CFreal nu = mu / wallRho;
+    
+      //this is not the best, but it avoids having to code another BC! because I
+      //would have to dynamic cast to the KOmega varset to get the beta1
+      const CFreal beta1 = 0.075;
+      
+      const CFuint omegaID = iK+1; 
+      
+      ///@todo here should this be adimensionalized (by the distance)???
+      //Menter's definition
+      // for stability, gradually increase w_wall
+      const CFreal omegaWallTh = log((60. * nu) / (beta1 * y0 * y0));//(10. * 6. * nu) / (beta1 * y0 * y0);
+      //const CFreal omegaWall = iter < m_imposeOmegaWallIter ? min(omegaWallTh,m_omegaWallFactor*m_intSolPhysData[omegaID]): omegaWallTh;
+      const CFreal omegaWall = iter < m_imposeOmegaWallIter ? min(omegaWallTh,log(m_omegaWallFactor)*iter+5.0): omegaWallTh;
+
+      if (m_prevIter < iter && iter < m_imposeOmegaWallIter) 
+      {
+        CFLog(INFO, "OmegaWall log difference (-inf -> 0): " << log10(fabs(1+(exp(omegaWall)-exp(omegaWallTh))/exp(omegaWallTh))) << "\n");
+        
+        m_prevIter = iter;
+      }
+      
+      cf_assert(omegaWall>0.0);
+
+      m_ghostSolPhysData[omegaID] = omegaWall;
+      
+      m_ghostSolPhysData[EulerTerm::E] += m_ghostSolPhysData[iK];
+      m_ghostSolPhysData[EulerTerm::H] += m_ghostSolPhysData[iK];
+    }
+    
+    // check if LCTM is active
+    if (nbTurbVars == 4)
+    {
+//       const CFreal muTot = m_diffVarTurb->getDynViscosity(intStates, m_cellGradFlxPnt[flxIdx]);
+//        const CFreal tau = m_muWall*(m_unitNormalFlxPnts[flxIdx][YY]*MathFunctions::innerProd(*(m_cellGradFlxPnt[flxIdx][m_UID]),m_unitNormalFlxPnts[flxIdx]) -
+//       m_unitNormalFlxPnts[flxIdx][XX]*MathFunctions::innerProd(*(m_cellGradFlxPnt[flxIdx][m_VID]),m_unitNormalFlxPnts[flxIdx]))
+//        const CFreal wallShear = 
+//        
+//        m_muWall = m_diffVar->getDynViscosity(*(m_cellStatesFlxPnt[flxIdx]), m_cellGradFlxPnt[flxIdx]);
+//  
+//  // this will not work adimensional
+//  // const CFreal tauRef = 1.0; // mu_ref*Uref/refLength;
+//  const CFreal gamma = m_updateVarSet->getModel()->getGamma();
+//  const bool adim = Framework::PhysicalModelStack::getActive()->getImplementor()->isAdimensional();
+//  const CFuint dim = PhysicalModelStack::getActive()->getDim();
+//  
+//  m_tau = 0.0;
+//  m_Cf = 0.0;
+//  
+//  if (dim == DIM_2D) {
+//    
+//    m_tau = m_muWall*
+//      (m_unitNormalFlxPnts[flxIdx][YY]*MathFunctions::innerProd(*(m_cellGradFlxPnt[flxIdx][m_UID]),m_unitNormalFlxPnts[flxIdx]) -
+//       m_unitNormalFlxPnts[flxIdx][XX]*MathFunctions::innerProd(*(m_cellGradFlxPnt[flxIdx][m_VID]),m_unitNormalFlxPnts[flxIdx]));
+//    
+//    if(adim){
+//      //check this
+//      const CFreal mInf = m_updateVarSet->getModel()->getMachInf();
+//      const CFreal Re = m_diffVar->getModel().getReynolds();
+//      m_Cf = m_tau / (0.5*mInf*sqrt(gamma)*Re);
+//    }
+//    else{
+//      // friction coefficient 
+//      m_Cf = m_tau / (0.5*m_rhoInf*m_uInf*m_uInf);
+//    } 
+//    
+//    m_frictionForces[XX] =  m_Cf*m_unitNormalFlxPnts[flxIdx][YY];
+//    m_frictionForces[YY] = -m_Cf*m_unitNormalFlxPnts[flxIdx][XX];
+//  }
+        
+      m_ghostSolPhysData[EulerTerm::GAMMA] = m_intSolPhysData[EulerTerm::GAMMA];
+      //CFLog(INFO, "coord: " << coords[iState][XX] << "\n");
+      //CFLog(INFO, "is turb: " << transitionCriterion(iState) << ", transition occurred: " << m_transitionOccurred << "\n");
+      if (m_wallLaw)
+      {
+        // the wall law of the source (computed in the previous residual evaluation); 0.01 until it is known
+        const std::map< std::pair<CFreal,CFreal>, CFreal >& law = gammaAlphaWallLawTable();
+        const std::map< std::pair<CFreal,CFreal>, CFreal >::const_iterator it =
+          findWallPoint(law, coords[iState][XX], coords[iState][YY]);
+        m_ghostSolPhysData[iK+2] = (it == law.end() || m_enforceLaminar) ? 0.01 : it->second;
+        // diagnostic: wall points without a law value once the law exists (a key mismatch)
+        if (it == law.end() && !law.empty() && (++m_wallLawMisses % 100000) == 1)
+        {
+          CFLog(INFO, "BCNoSlipWallGammaAlpha2D: no wall-law value at (" << coords[iState][XX] << ", " << coords[iState][YY]
+                << "); misses so far " << m_wallLawMisses << "\n");
+        }
+      }
+      else if (m_smoothOnset)
+      {
+        const CFreal fOnset = smoothOnsetFraction(coords[iState]);
+        m_ghostSolPhysData[iK+2] = (1.0 - fOnset)*0.01 + fOnset*m_intSolPhysData[iK+2];
+      }
+      else if (releaseGammaAtWall(m_intSolPhysData[iK+2], transitionCriterion(iState), coords[iState][XX]))
+      {
+        // gamma
+        m_ghostSolPhysData[iK+2] = m_intSolPhysData[iK+2];
+        
+        if (!m_transitionOccurred)
+        {
+          m_transitionOccurred = true;
+          CFLog(INFO,"\n\n\n Transition occurred!\n\n\n");
+        }
+      }
+      else
+      {
+        // gamma
+        m_ghostSolPhysData[iK+2] = 0.01;
+      }
+      
+      // Alpha
+      m_ghostSolPhysData[iK+3] = m_intSolPhysData[iK+3];
+    }
+    else if (nbTurbVars == 3)
+    {
+      m_ghostSolPhysData[EulerTerm::GAMMA] = m_intSolPhysData[EulerTerm::GAMMA];
+
+      // gamma
+      m_ghostSolPhysData[iK+1] = m_intSolPhysData[iK+1];
+      
+      // Re
+      m_ghostSolPhysData[iK+2] = m_intSolPhysData[iK+2]; 
+    }
+
+    // set the ghost state from its physical data
+    m_varSetTurb->computeStateFromPhysicalData(m_ghostSolPhysData,ghostState);
+    
+    //CFLog(INFO, "ghostState: " << ghostState << "\n");
+  }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+void BCNoSlipWallGammaAlpha2D::computeGhostGradients
+                                                    (const std::vector< std::vector< RealVector* > >& intGrads,
+                                                     std::vector< std::vector< RealVector* > >& ghostGrads,
+                                                     const std::vector< RealVector >& normals,
+                                                     const std::vector< RealVector >& coords)
+{
+  // number of state gradients
+  const CFuint nbrStateGrads = intGrads.size();
+  cf_assert(nbrStateGrads == ghostGrads.size());
+  cf_assert(nbrStateGrads == normals.size());
+
+  // number of gradient variables
+  cf_assert(nbrStateGrads > 0);
+  const CFuint nbrGradVars = intGrads[0].size();
+
+  // set the ghost gradients
+  for (CFuint iState = 0; iState < nbrStateGrads; ++iState)
+  {
+    for (CFuint iGradVar = 0; iGradVar < nbrGradVars; ++iGradVar)
+    {
+      *ghostGrads[iState][iGradVar] = *intGrads[iState][iGradVar];
+    }
+  }
+  
+  if (m_heatFlux)
+  { 
+    for (CFuint iState = 0; iState < nbrStateGrads; ++iState)
+    {
+      // normal
+      const RealVector& normal = normals[iState];
+    
+      // temperature
+      RealVector& tempGradI = *intGrads  [iState][3];
+      RealVector& tempGradG = *ghostGrads[iState][3];
+      const CFreal nTempGrad = tempGradI[XX]*normal[XX] + tempGradI[YY]*normal[YY];
+      tempGradG = tempGradI - nTempGrad*normal + m_wallQ*normal; //tempGradI - 2.0*nTempGrad*normal + m_wallQ*normal;
+      
+      // pressure
+//      RealVector& pGradI = *intGrads  [iState][0];
+//      RealVector& pGradG = *ghostGrads[iState][0];
+//      const CFreal nPGrad = pGradI[XX]*normal[XX] + pGradI[YY]*normal[YY];
+//      pGradG = pGradI - nPGrad*normal;
+    }
+  }
+  
+  // check if LCTM is active
+  if (nbrGradVars > 6)
+  {
+    for (CFuint iState = 0; iState < nbrStateGrads; ++iState)
+    {
+      // normal
+      const RealVector& normal = normals[iState];
+    
+      // gamma
+      RealVector& gammaGradI = *intGrads  [iState][nbrGradVars-2];
+      RealVector& gammaGradG = *ghostGrads[iState][nbrGradVars-2];
+      const CFreal nGammaGrad = gammaGradI[XX]*normal[XX] + gammaGradI[YY]*normal[YY];
+      gammaGradG = gammaGradI - nGammaGrad*normal; //tempGradI - 2.0*nTempGrad*normal + m_wallQ*normal;
+      
+      // Ret
+      RealVector& RetGradI = *intGrads  [iState][nbrGradVars-1];
+      RealVector& RetGradG = *ghostGrads[iState][nbrGradVars-1];
+      const CFreal nRetGrad = RetGradI[XX]*normal[XX] + RetGradI[YY]*normal[YY];
+      RetGradG = RetGradI - nRetGrad*normal;
+    }
+  }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+void BCNoSlipWallGammaAlpha2D::computeBndGradVars(const std::vector< RealVector* >& gradVarsFlxPnt,
+                                                  const std::vector< Framework::State* >& intStates,
+                                                  const std::vector< Framework::State* >& ghostStates,
+                                                  const std::vector< RealVector >& unitNormals,
+                                                  const std::vector< RealVector >& flxPntCoords,
+                                                  std::vector< RealVector* >& bndGradVars)
+{
+  const CFuint nbrStates = intStates.size();
+  // index of k in a state and in the gradient variables, after p, the velocity and T; not the
+  // index of k in the physical data, which is what getFirstScalarVar returns
+  const CFuint iK = DIM_2D+2;
+  const CFuint nbTurbVars = m_varSetTurb->getModel()->getNbScalarVars(0);
+
+  // g_b = a with the wall values: the wall velocity, the wall temperature of an isothermal
+  // wall, and KWall, the wall value of log-omega and gamma the ghost state carries
+  for (CFuint iState = 0; iState < nbrStates; ++iState)
+  {
+    const RealVector& ghostState = *ghostStates[iState];
+    RealVector& bndGradVarsState = *bndGradVars[iState];
+
+    bndGradVarsState = *gradVarsFlxPnt[iState];
+    bndGradVarsState[1] = m_xWallVelocity;
+    bndGradVarsState[2] = m_yWallVelocity;
+    if (!m_heatFlux)
+    {
+      bndGradVarsState[DIM_2D+1] = m_wallT;
+    }
+    bndGradVarsState[iK] = ghostState[iK];
+    if (nbTurbVars == 2 || nbTurbVars == 4)
+    {
+      bndGradVarsState[iK+1] = ghostState[iK+1];
+    }
+    // gamma: the ghost value, 0.01 for a laminar wall, the interior value once transition occurred
+    if (nbTurbVars == 4)
+    {
+      bndGradVarsState[iK+2] = ghostState[iK+2];
+    }
+  }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+void BCNoSlipWallGammaAlpha2D::computeBndStates(const std::vector< Framework::State* >& intStates,
+                                                const std::vector< Framework::State* >& ghostStates,
+                                                const std::vector< RealVector >& unitNormals,
+                                                const std::vector< RealVector >& flxPntCoords,
+                                                std::vector< RealVector* >& bndStates)
+{
+  const CFuint nbrStates = intStates.size();
+
+  // U_b is the wall state: the interior pressure, the wall velocity, the wall temperature of an
+  // isothermal wall or the interior one of a heat-flux wall, and the wall values of the
+  // turbulence variables the ghost state carries
+  for (CFuint iState = 0; iState < nbrStates; ++iState)
+  {
+    const RealVector& intState = *intStates[iState];
+    RealVector& bndState = *bndStates[iState];
+
+    bndState = *ghostStates[iState];
+    bndState[0] = intState[0];
+    bndState[1] = m_xWallVelocity;
+    bndState[2] = m_yWallVelocity;
+    bndState[DIM_2D+1] = m_heatFlux ? intState[DIM_2D+1] : m_wallT;
+  }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+void BCNoSlipWallGammaAlpha2D::computeBndGrads(const std::vector< std::vector< RealVector* > >& intGrads,
+                                               std::vector< std::vector< RealVector* > >& bndGrads,
+                                               const std::vector< RealVector* >& bndStates,
+                                               const std::vector< RealVector >& unitNormals,
+                                               const std::vector< RealVector >& flxPntCoords)
+{
+  // q_b = q
+  copyGradients(intGrads,bndGrads);
+
+  // no diffusive flux of gamma and Re_theta through the wall: their normal component is removed
+  const CFuint nbTurbVars = m_varSetTurb->getModel()->getNbScalarVars(0);
+  if (nbTurbVars == 4)
+  {
+    // index of k in the gradients, as in computeBndGradVars
+    const CFuint iK = DIM_2D+2;
+    const CFuint nbrFlxPnts = intGrads.size();
+    for (CFuint iFlx = 0; iFlx < nbrFlxPnts; ++iFlx)
+    {
+      if (m_wallLaw)
+      {
+        // gamma: Dirichlet with the wall-law value everywhere; the normal gradient stays in the wall flux
+      }
+      else if (m_smoothOnset && m_dirichletPreOnset)
+      {
+        // gamma: the compact (BR2-lifted) gradient carries the ghost value; remove its normal part only after onset
+        RealVector& gammaGrad = *bndGrads[iFlx][iK+2];
+        const CFreal fOnset = smoothOnsetFraction(flxPntCoords[iFlx]);
+        const CFreal nGrad = gammaGrad[XX]*unitNormals[iFlx][XX] + gammaGrad[YY]*unitNormals[iFlx][YY];
+        gammaGrad[XX] -= fOnset*nGrad*unitNormals[iFlx][XX];
+        gammaGrad[YY] -= fOnset*nGrad*unitNormals[iFlx][YY];
+      }
+      else
+      {
+        removeNormalComponent(*bndGrads[iFlx][iK+2],unitNormals[iFlx]);
+      }
+      removeNormalComponent(*bndGrads[iFlx][iK+3],unitNormals[iFlx]);
+    }
+  }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+void BCNoSlipWallGammaAlpha2D::constrainBndGrads(const RealVector& bndState,
+                                                 std::vector< RealVector* >& bndGrads,
+                                                 const RealVector& unitNormal,
+                                                 const RealVector& flxPntCoord)
+{
+  if (m_heatFlux)
+  {
+    prescribeNSWallHeatFlux(*m_diffVarTurb,bndState,bndGrads,unitNormal,DIM_2D+1,m_wallQ);
+  }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+void BCNoSlipWallGammaAlpha2D::setup()
+{
+  CFAUTOTRACE;
+
+  // setup of the parent class
+  BCStateComputer::setup();
+
+  // no flux point coordinates required
+  m_needsSpatCoord = true;//false;
+
+  m_varSetTurb = getMethodData().getUpdateVar().d_castTo<ConvTurb2DVarSet>();
+
+  m_diffVarTurb = getMethodData().getDiffusiveVar().d_castTo<DiffTurb2DVarSet>();
+
+  m_varSetTurb->getModel()->resizePhysicalData(m_intSolPhysData);
+  m_varSetTurb->getModel()->resizePhysicalData(m_ghostSolPhysData);
+  
+  m_xWallVelocity /= m_varSetTurb->getModel()->getVelRef();
+  m_yWallVelocity /= m_varSetTurb->getModel()->getVelRef();
+  
+  cf_assert(m_wallK >= 0.0);
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+  }  // namespace FluxReconstructionMethod
+
+}  // namespace COOLFluiD
+
